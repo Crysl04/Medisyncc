@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>{% block title %}MediSync{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="dashboard-body">
+  <aside>
+    <div>
+      <div class="logo">MediSync</div>
+      <nav>
+        <a href="{{ url_for('dashboard') }}"><span>📊</span>Dashboard</a>
+        <a href="{{ url_for('notification') }}"><span>🔔</span>Notifications</a>
+        <a href="{{ url_for('products') }}"><span>💊</span>Products</a>
+        <a href="{{ url_for('purchases') }}"><span>🛒</span>Purchase</a>
+        <a href="{{ url_for('orders') }}"><span>👥</span>Orders</a>
+      </nav>
+    </div>
+    <a href="/logout" class="logout">Log out</a>
+  </aside>
+
+  <main class="main">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
