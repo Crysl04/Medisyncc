@@ -1,0 +1,221 @@
+{% extends 'layout.html' %}
+{% block title %}MediSync - Orders{% endblock %}
+
+{% block content %}
+<div class="main">
+  <header class="dashboard-header">
+    <h1>Inventory Management</h1>
+    <div style="display: flex; align-items: center; gap: 10px;">
+      <img src="static//profile.png"            
+          alt="Profile Picture" width="40" height="40" style="border-radius: 50%;"> 
+      <div>
+        <strong>{{ session['name'] }}</strong><br>
+        <small>Administrator</small>
+      </div>
+    </div>
+  </header>
+  
+  <hr class="hr-line">
+
+  <div class="products-controls">
+    <div class="filter-btn">
+      <input type="text" id="searchOrders" placeholder="Search orders..." onkeyup="applyOrderFilters()" />
+      <button onclick="toggleOrderFilterOptions()">
+        <img src="{{ url_for('static', filename='filter.png') }}" alt="Filter Icon" class="filter-icon">
+        FILTER
+      </button>
+      <div id="orderFilterOptions" class="filter-options" style="display: none;">
+        <div class="filter-group">
+          <label>Batch Number:</label>
+          <input type="text" id="batchFilter" placeholder="Enter batch number..." onkeyup="applyOrderFilters()" />
+        </div>
+        <div class="filter-group">
+          <label>Order Date:</label>
+          <input type="date" id="dateFilter" onchange="applyOrderFilters()" />
+        </div>
+      </div>
+    </div>
+    <button class="add-btn" onclick="openOrderModal()">+ Add Order</button>
+  </div>
+
+  <div class="orders-table">
+    <table id="ordersTable">
+      <thead>
+        <tr>
+          <th>
+            <button class="sort-btn" data-sort="id">Order ID</button>
+          </th>
+          <th>
+            <button class="sort-btn" data-sort="name">Item Name</button>
+          </th>
+          <th>
+            <button class="sort-btn" data-sort="batch">Batch Number</button>
+          </th>
+          <th>
+            <button class="sort-btn" data-sort="quantity">Quantity</button>
+          </th>
+          <th>
+            <button class="sort-btn" data-sort="date">Order Date</button>
+          </th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if orders %}
+          {% for order in orders %}
+            <tr data-batch="{{ order[3] }}" data-date="{{ order[4] }}">
+              <td>{{ order[0] }}</td>
+              <td>{{ order[1] }}</td>
+              <td>{{ order[3] }}</td>
+              <td>{{ order[2] }}</td>
+              <td>{{ order[4] }}</td>
+            </tr>
+          {% endfor %}
+        {% else %}
+          <tr>
+            <td colspan="5" style="text-align: center;">No orders found</td>
+          </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</main>
+
+<div id="orderModal" class="modal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100vw; height:100vh; background:rgba(0,0,0,0.4);">
+  <div style="background:#fff; margin:5% auto; padding:20px; border-radius:8px; width:350px; position:relative;">
+    <h2>Add Order</h2>
+    <form id="addOrderForm" method="POST" action="/add-order">
+      <label>Product:</label><br>
+      <select name="product_id" required>
+        <option value="">Select Product</option>
+        {% for prod in products %}
+          <option value="{{ prod[0] }}">{{ prod[1] }}</option>
+        {% endfor %}
+      </select><br><br>
+
+      <label>Batch Number:</label><br>
+      <input type="text" name="batch_number" required><br><br>
+
+      <label>Order Quantity:</label><br>
+      <input type="number" name="order_quantity" min="1" required><br><br>
+
+      <div style="text-align:right;">
+        <button type="button" onclick="closeOrderModal()">Cancel</button>
+        <button type="submit">Add</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    const table = document.getElementById('ordersTable');
+    const cells = table.getElementsByTagName('td');
+    
+    for (let cell of cells) {
+      cell.addEventListener('click', function() {
+        const allCells = table.getElementsByTagName('td');
+        for (let c of allCells) {
+          c.classList.remove('expanded');
+        }
+        
+        this.classList.toggle('expanded');
+      });
+    }
+  });
+
+  function toggleOrderFilterOptions() {
+    const filterBox = document.getElementById("orderFilterOptions");
+    filterBox.style.display = filterBox.style.display === "none" ? "block" : "none";
+  }
+
+  function applyOrderFilters() {
+    const searchValue = document.getElementById("searchOrders").value.toLowerCase();
+    const batchValue = document.getElementById("batchFilter").value.toLowerCase();
+    const dateValue = document.getElementById("dateFilter").value;
+
+    const rows = document.querySelectorAll("#ordersTable tbody tr");
+
+    rows.forEach(row => {
+      const text = row.textContent.toLowerCase();
+      const rowBatch = row.getAttribute("data-batch")?.toLowerCase();
+      const rowDate = row.getAttribute("data-date");
+
+      const matchesSearch = text.includes(searchValue);
+      const matchesBatch = rowBatch.includes(batchValue);
+      const matchesDate = dateValue === "" || rowDate === dateValue;
+
+      row.style.display = matchesSearch && matchesBatch && matchesDate ? "" : "none";
+    });
+  }
+
+  function openOrderModal() {
+    document.getElementById("orderModal").style.display = "block";
+  }
+
+  function closeOrderModal() {
+    document.getElementById("orderModal").style.display = "none";
+  }
+
+  let currentSort = {
+    column: 'id',
+    direction: 'asc'
+  };
+
+  function sortTable() {
+    const table = document.getElementById('ordersTable');
+    const tbody = table.querySelector('tbody');
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    
+    rows.sort((a, b) => {
+      let aValue = a.children[getColumnIndex(currentSort.column)].textContent;
+      let bValue = b.children[getColumnIndex(currentSort.column)].textContent;
+      
+      if (currentSort.column === 'id' || currentSort.column === 'quantity') {
+        aValue = parseFloat(aValue.replace(/[^0-9.-]+/g, ''));
+        bValue = parseFloat(bValue.replace(/[^0-9.-]+/g, ''));
+      }
+      
+      if (currentSort.column === 'date') {
+        aValue = new Date(aValue);
+        bValue = new Date(bValue);
+      }
+      
+      if (currentSort.direction === 'asc') {
+        return aValue > bValue ? 1 : -1;
+      } else {
+        return aValue < bValue ? 1 : -1;
+      }
+    });
+    
+    rows.forEach(row => tbody.appendChild(row));
+  }
+
+  sortTable();
+
+  document.querySelectorAll('.sort-btn').forEach(button => {
+    button.addEventListener('click', () => {
+      const column = button.dataset.sort;
+      
+      if (currentSort.column === column) {
+        currentSort.direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
+      } else {
+        currentSort.column = column;
+        currentSort.direction = 'asc';
+      }
+      
+      sortTable();
+    });
+  });
+
+  function getColumnIndex(column) {
+    const columnMap = {
+      'id': 0,
+      'name': 1,
+      'batch': 2,
+      'quantity': 3,
+      'date': 4
+    };
+    return columnMap[column];
+  }
+</script>
+{% endblock %}
