@@ -1,12 +1,20 @@
+import os
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
-import psycopg2
-from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
+from psycopg2.pool import SimpleConnectionPool
+import psycopg2
+from contextlib import contextmanager
 
+# ---------------------
+# Basic app config
+# ---------------------
 app = Flask(__name__)
-app.secret_key = 'your_secret_key_here'
+app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret-change-me")
 
-# Temporary admin credentials (username: admin, password: 1234)
+# ---------------------
+# Admin credentials (temporary)
+# ---------------------
+# You may remove or replace this with a proper user table.
 ADMIN_CREDENTIALS = {
     'admin': {
         'password': generate_password_hash('1234'),
@@ -14,575 +22,237 @@ ADMIN_CREDENTIALS = {
     },
     'admin2': {
         'password': generate_password_hash('4321'),
-        'name': 'Lie Jenica L. Egam'
+        'name': 'Assistant Admin'
     }
 }
 
+# ---------------------
+# Database connection pool
+# ---------------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set. Set it in Render dashboard.")
 
-def init_db():
+# Render and some providers give a DATABASE_URL that starts with 'postgres://'
+# psycopg2 expects 'postgresql://' in some installs, so normalize:
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Configure pool sizes as appropriate for your Render plan
+MIN_CONN = int(os.environ.get("DB_POOL_MIN", 1))
+MAX_CONN = int(os.environ.get("DB_POOL_MAX", 20))
+
+try:
+    pool = SimpleConnectionPool(MIN_CONN, MAX_CONN, dsn=DATABASE_URL)
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize DB connection pool: {e}")
+
+@contextmanager
+def get_cursor():
+    """
+    Context manager yielding a cursor from pooled connection.
+    Commits if no exception, rolls back on exception, and returns conn to pool.
+    Usage:
+        with get_cursor() as cur:
+            cur.execute(...)
+            rows = cur.fetchall()
+    """
     conn = None
+    cur = None
     try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS Category (
-            id SERIAL PRIMARY KEY,
-            category_name TEXT NOT NULL,
-            created_at DATE DEFAULT CURRENT_DATE
-        )''')
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS Unit (
-            unit_id SERIAL PRIMARY KEY,
-            unit_name TEXT NOT NULL
-        )''')
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS Product (
-            id SERIAL PRIMARY KEY,
-            product_name TEXT NOT NULL,
-            product_type TEXT NOT NULL,
-            category_id INTEGER REFERENCES Category(id),
-            stock_quantity INTEGER NOT NULL DEFAULT 0,
-            unit_id INTEGER REFERENCES Unit(unit_id),
-            stock_status TEXT DEFAULT 'in stock',
-            status TEXT DEFAULT 'active',
-            created_at DATE DEFAULT CURRENT_DATE
-        )''')
-        
+        conn = pool.getconn()
+        cur = conn.cursor()
+        yield cur
         conn.commit()
-        print("Database initialization schema check complete.")
     except Exception as e:
-        print(f"Error initializing database: {str(e)}")
         if conn:
             conn.rollback()
+        raise
     finally:
-        if conn is not None:
-            conn.close()
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn:
+            pool.putconn(conn)
 
-# Login required decorator
-def login_required(f):
-    def decorated_function(*args, **kwargs):
-        if 'logged_in' not in session:
-            flash('Please log in to access this page', 'error')
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    decorated_function.__name__ = f.__name__
-    return decorated_function
+# ---------------------
+# Helper utilities
+# ---------------------
+def is_logged_in():
+    return session.get("logged_in", False)
 
-# Routes
-@app.route('/')
+def login_user(username):
+    session["logged_in"] = True
+    session["username"] = username
+
+def logout_user():
+    session.clear()
+
+# ---------------------
+# Routes (example set; adapt to your existing templates & SQL)
+# ---------------------
+@app.route("/")
+def index():
+    # Example: fetch summary data for index page
+    products = []
+    try:
+        with get_cursor() as cur:
+            cur.execute("""
+                SELECT product_id, product_name, brand_name, batch_number, expiration_date, quantity
+                FROM Product
+                ORDER BY product_name
+                LIMIT 200
+            """)
+            rows = cur.fetchall()
+            for r in rows:
+                products.append({
+                    "product_id": r[0],
+                    "product_name": r[1],
+                    "brand_name": r[2],
+                    "batch_number": r[3],
+                    "expiration_date": r[4],
+                    "quantity": r[5]
+                })
+    except Exception as e:
+        app.logger.error("Index DB error: %s", e)
+        flash("Could not load products.", "danger")
+
+    return render_template("index.html", products=products)
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    session.clear()
-    return render_template('index.html')
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
 
-@app.route('/auth', methods=['POST'])
-def auth():
-    username = request.form['username']
-    password = request.form['password']
+        # Example: check in ADMIN_CREDENTIALS first (temporary)
+        admin = ADMIN_CREDENTIALS.get(username)
+        if admin and check_password_hash(admin["password"], password):
+            login_user(username)
+            flash("Logged in successfully.", "success")
+            return redirect(url_for("index"))
 
-    user = ADMIN_CREDENTIALS.get(username)
-    if user and check_password_hash(user['password'], password):
-        session['logged_in'] = True
-        session['username'] = username
-        session['name'] = user['name']
-        return redirect(url_for('dashboard'))
-    else:
-        flash('Invalid credentials', 'error')
-        return redirect(url_for('login'))
+        # Alternatively, check a user table in DB (recommended)
+        try:
+            with get_cursor() as cur:
+                cur.execute("SELECT username, password_hash FROM users WHERE username = %s", (username,))
+                row = cur.fetchone()
+                if row and check_password_hash(row[1], password):
+                    login_user(username)
+                    flash("Logged in successfully.", "success")
+                    return redirect(url_for("index"))
+        except Exception as e:
+            app.logger.error("Login DB error: %s", e)
+            flash("Login failed.", "danger")
 
+        flash("Invalid credentials.", "danger")
+        return redirect(url_for("login"))
+    return render_template("admin.html")  # or login.html if you have one
 
-@app.route('/logout')
+@app.route("/logout")
 def logout():
-    session.clear()
-    return redirect(url_for('login'))
+    logout_user()
+    flash("Logged out.", "info")
+    return redirect(url_for("index"))
 
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        
-        # Get total stocks (sum of quantity of active products)
-        c.execute("""
-            SELECT SUM(stock_quantity) 
-            FROM Product 
-            WHERE status = 'active'
-        """)
-        total_stocks_quantity = c.fetchone()[0] or 0
-
-        # Get total medicines and supplies (count of active products by type)
-        c.execute("""
-            SELECT 
-                SUM(CASE WHEN product_type = 'medicine' THEN 1 ELSE 0 END) as medicines,
-                SUM(CASE WHEN product_type = 'supply' THEN 1 ELSE 0 END) as supplies
-            FROM Product 
-            WHERE status = 'active'
-        """)
-        result = c.fetchone()
-        total_medicines_count = result[0] or 0
-        total_supplies_count = result[1] or 0
-
-        # Get stock-ins for this week (medicines and supplies)
-        c.execute("""
-            SELECT 
-                SUM(CASE WHEN pr.product_type = 'medicine' THEN p.purchase_quantity ELSE 0 END) as medicines,
-                SUM(CASE WHEN pr.product_type = 'supply' THEN p.purchase_quantity ELSE 0 END) as supplies
-            FROM Purchase p
-            JOIN Product pr ON p.product_id = pr.id
-            WHERE p.purchase_date >= CURRENT_DATE - INTERVAL '7 days'
-        """)
-        result_stockins = c.fetchone()
-        stockins_medicines = result_stockins[0] or 0
-        stockins_supplies = result_stockins[1] or 0
-
-        # Get stock-outs for this week (medicines and supplies)
-        c.execute("""
-            SELECT 
-                SUM(CASE WHEN pr.product_type = 'medicine' THEN o.order_quantity ELSE 0 END) as medicines,
-                SUM(CASE WHEN pr.product_type = 'supply' THEN o.order_quantity ELSE 0 END) as supplies
-            FROM "Order" o
-            JOIN Product pr ON o.product_id = pr.id
-            WHERE o.order_date >= CURRENT_DATE - INTERVAL '7 days'
-        """)
-        result_stockouts = c.fetchone()
-        stockouts_medicines = result_stockouts[0] or 0
-        stockouts_supplies = result_stockouts[1] or 0
-
-        # Get total out of stock items
-        c.execute("""
-            SELECT COUNT(*) 
-            FROM Product 
-            WHERE stock_status = 'out of stock' AND status = 'active'
-        """)
-        total_out_of_stock = c.fetchone()[0] or 0
-
-        # Get total orders
-        c.execute("""
-            SELECT COUNT(*) 
-            FROM "Order"
-        """)
-        total_orders = c.fetchone()[0] or 0
-
-        # Get total purchases with near-expiry status
-        c.execute("""
-            SELECT COUNT(*) 
-            FROM Purchase 
-            WHERE status = 'near expiry'
-        """)
-        total_expiring_soon = c.fetchone()[0] or 0
-
-        # Get expiring soon items with details
-        c.execute("""
-            SELECT p.id as code, pr.product_name as name, p.expiration_date as expiration
-            FROM Purchase p
-            JOIN Product pr ON p.product_id = pr.id
-            WHERE p.status = 'near expiry'
-            ORDER BY p.expiration_date ASC
-        """)
-        expiring_soon = [{'code': row[0], 'name': row[1], 'expiration': row[2]} for row in c.fetchall()]
-
-        return render_template('admin.html', 
-                             total_stocks=total_stocks_quantity,
-                             out_of_stocks=total_out_of_stock,
-                             total_orders=total_orders,
-                             expiring_soon=expiring_soon,
-                             medicines=total_medicines_count,
-                             supplies=total_supplies_count,
-                             stockins_medicines=stockins_medicines,
-                             stockins_supplies=stockins_supplies,
-                             stockouts_medicines=stockouts_medicines,
-                             stockouts_supplies=stockouts_supplies)
-    except Exception as e:
-        print(f"Error in dashboard route: {str(e)}")
-        flash(f'Error loading dashboard: {str(e)}', 'error')
-        return render_template('admin.html', 
-                             total_stocks=0,
-                             out_of_stocks=0,
-                             total_orders=0,
-                             expiring_soon=[],
-                             medicines=0,
-                             supplies=0,
-                             stockins_medicines=0,
-                             stockins_supplies=0,
-                             stockouts_medicines=0,
-                             stockouts_supplies=0)
-    finally:
-        if conn is not None:
-            conn.close()
-
-@app.route('/products')
-@login_required
+# Example product page (list)
+@app.route("/products")
 def products():
-    conn = None
+    items = []
     try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        c.execute("""
-            SELECT p.id, p.product_name, p.product_type, p.stock_quantity, 
-                   c.category_name, u.unit_name, p.stock_status
-            FROM Product p
-            LEFT JOIN Category c ON p.category_id = c.id
-            LEFT JOIN Unit u ON p.unit_id = u.unit_id
-            ORDER BY p.id DESC
-        """)
-        products = c.fetchall()
-        c.execute("SELECT id, category_name FROM Category")
-        categories = c.fetchall()
-        c.execute("SELECT unit_id, unit_name FROM Unit")
-        units = c.fetchall()
-        c.execute("SELECT DISTINCT product_type FROM Product")
-        product_types = [row[0] for row in c.fetchall()]
-        return render_template('products.html', 
-                             products=products,
-                             categories=categories,
-                             units=units,
-                             product_types=product_types)
+        with get_cursor() as cur:
+            cur.execute("""
+                SELECT product_id, product_name, brand_name, unit, quantity, status
+                FROM Product
+                ORDER BY product_name
+            """)
+            for r in cur.fetchall():
+                items.append({
+                    "product_id": r[0],
+                    "product_name": r[1],
+                    "brand_name": r[2],
+                    "unit": r[3],
+                    "quantity": r[4],
+                    "status": r[5]
+                })
     except Exception as e:
-        print(f"Error in products route: {str(e)}")
-        flash(f'Error loading products: {str(e)}', 'error')
-        return render_template('products.html', products=[], categories=[], units=[], product_types=[])
-    finally:
-        if conn is not None:
-            conn.close()
+        app.logger.error("Products error: %s", e)
+        flash("Failed to load products.", "danger")
 
-@app.route('/purchases')
-@login_required
-def purchases():
-    conn = None
+    return render_template("products.html", products=items)  # ensure products.html exists or adapt
+
+# Transaction endpoint to add stock-in or stock-out (example)
+@app.route("/transaction/add", methods=["POST"])
+def add_transaction():
+    if not is_logged_in():
+        flash("Login required", "warning")
+        return redirect(url_for("login"))
+
+    product_id = request.form.get("product_id")
+    change_qty = int(request.form.get("quantity", 0))
+    ttype = request.form.get("type", "stock-in")  # 'stock-in' or 'stock-out'
+    created_by = session.get("username", "system")
+
     try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        c.execute("""
-            SELECT pu.id, pr.product_name, pu.batch_number, pu.purchase_quantity, 
-                   pu.remaining_quantity, pu.expiration_date, pu.status, pu.purchase_date
-            FROM Purchase pu
-            LEFT JOIN Product pr ON pu.product_id = pr.id
-            ORDER BY pu.purchase_date DESC
-        """)
-        purchases = c.fetchall()
-        c.execute("SELECT id, product_name FROM Product ORDER BY product_name ASC")
-        products = c.fetchall()
-        print("Purchases fetched:", purchases)
-        return render_template('purchase.html', purchases=purchases, products=products)
-    except Exception as e:
-        print(f"Error in purchases route: {str(e)}")
-        flash(f'Error loading purchases: {str(e)}', 'error')
-        return render_template('purchase.html', purchases=[], products=[])
-    finally:
-        if conn is not None:
-            conn.close()
+        with get_cursor() as cur:
+            # Insert transaction
+            cur.execute("""
+                INSERT INTO Transaction (product_id, quantity, type, created_by, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                RETURNING id
+            """, (product_id, change_qty, ttype, created_by))
+            tx_id = cur.fetchone()[0]
 
-@app.route('/orders')
-@login_required
-def orders():
-    conn = None
+            # Update product quantity (example)
+            if ttype == "stock-in":
+                cur.execute("UPDATE Product SET quantity = quantity + %s WHERE product_id = %s", (change_qty, product_id))
+            else:
+                cur.execute("UPDATE Product SET quantity = GREATEST(quantity - %s, 0) WHERE product_id = %s", (change_qty, product_id))
+
+        flash("Transaction recorded.", "success")
+    except Exception as e:
+        app.logger.error("Add transaction error: %s", e)
+        flash("Failed to record transaction.", "danger")
+
+    return redirect(url_for("index"))
+
+# Notifications example
+@app.route("/notifications")
+def notifications():
+    notes = []
     try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        c.execute("""
-            SELECT o.order_id, p.product_name, o.order_quantity, o.batch_number, o.order_date
-            FROM "Order" o
-            LEFT JOIN Product p ON o.product_id = p.id
-            ORDER BY o.order_date DESC
-        """)
-        orders = c.fetchall()
-        c.execute("SELECT id, product_name FROM Product ORDER BY product_name ASC")
-        products = c.fetchall()
-        print("Orders fetched:", orders)
-        return render_template('orders.html', orders=orders, products=products)
+        with get_cursor() as cur:
+            cur.execute("SELECT id, message, created_at, is_read FROM Notification ORDER BY created_at DESC LIMIT 50")
+            for r in cur.fetchall():
+                notes.append({"id": r[0], "message": r[1], "created_at": r[2], "is_read": r[3]})
     except Exception as e:
-        print(f"Error in orders route: {str(e)}")
-        flash(f'Error loading orders: {str(e)}', 'error')
-        return render_template('orders.html', orders=[], products=[])
-    finally:
-        if conn is not None:
-            conn.close()
+        app.logger.error("Notifications error: %s", e)
+        flash("Could not load notifications.", "danger")
 
-@app.route('/notification')
-@login_required
-def notification():
-    conn = None
+    return render_template("notification.html", notifications=notes)
+
+# Simple health check
+@app.route("/healthz")
+def healthz():
     try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        c.execute("""
-            SELECT id, message, created_at, is_read, type
-            FROM public.notification
-            ORDER BY created_at DESC
-        """)
-        notifications = c.fetchall()
-        print("Fetched notifications:", notifications)  # Debug print
-        return render_template('notification.html', notifications=notifications)
+        with get_cursor() as cur:
+            cur.execute("SELECT 1")
+            _ = cur.fetchone()
+        return jsonify({"status": "ok"})
     except Exception as e:
-        print(f"Error in notification route: {str(e)}")
-        flash(f'Error loading notifications: {str(e)}', 'error')
-        return render_template('notification.html', notifications=[])
-    finally:
-        if conn is not None:
-            conn.close()
+        app.logger.error("Health check failed: %s", e)
+        return jsonify({"status": "error", "detail": str(e)}), 500
 
-@app.route('/add-product', methods=['POST'])
-@login_required
-def add_product():
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        
-        # Get form data
-        product_name = request.form['product_name']
-        product_type = request.form['product_type']
-        category_id = request.form['category_id']
-        unit_id = request.form['unit_id']
-        
-        # Insert new product
-        c.execute("""
-            INSERT INTO Product (product_name, product_type, category_id, 
-                               stock_quantity, unit_id)
-            VALUES (%s, %s, %s, 0, %s)
-            RETURNING id
-        """, (product_name, product_type, category_id, unit_id))
-        
-        conn.commit()
-        flash('Product added successfully!', 'success')
-        return redirect(url_for('products'))
-        
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        flash(f'Error adding product: {str(e)}', 'error')
-        return redirect(url_for('products'))
-    finally:
-        if conn is not None:
-            conn.close()
+# ---------------------
+# Shutdown handler to close pool (optional)
+# ---------------------
+@app.teardown_appcontext
+def close_db_pool(exc):
+    # we intentionally do NOT close the pool here because Render restarts may call teardown multiple times.
+    # If you need to close the pool on process stop, handle it in a separate management script.
+    pass
 
-@app.route('/test-db')
-def test_db():
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        
-        # Test Category table
-        c.execute("SELECT * FROM Category")
-        categories = c.fetchall()
-        print("\n=== Categories ===")
-        for cat in categories:
-            print(cat)
-        
-        # Test Unit table
-        c.execute("SELECT * FROM Unit")
-        units = c.fetchall()
-        print("\n=== Units ===")
-        for unit in units:
-            print(unit)
-        
-        # Test Product table with joins
-        c.execute("""
-            SELECT p.*, c.category_name, u.unit_name 
-            FROM Product p
-            LEFT JOIN Category c ON p.category_id = c.id
-            LEFT JOIN Unit u ON p.unit_id = u.unit_id
-        """)
-        products = c.fetchall()
-        print("\n=== Products ===")
-        for prod in products:
-            print(prod)
-        
-        return jsonify({
-            'categories': categories,
-            'units': units,
-            'products': products
-        })
-    except Exception as e:
-        print(f"Database test error: {str(e)}")
-        return jsonify({'error': str(e)})
-    finally:
-        if conn is not None:
-            conn.close()
-
-@app.route('/init-sample-data')
-def init_sample_data():
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        
-        # Insert sample categories
-        categories = [
-            ('Analgesics',),
-            ('Antibiotics',),
-            ('Antihistamines',),
-            ('First Aid',)
-        ]
-        c.executemany("INSERT INTO Category (category_name) VALUES (%s)", categories)
-        
-        # Insert sample units
-        units = [
-            ('Tablet',),
-            ('Capsule',),
-            ('Bottle',),
-            ('Box',)
-        ]
-        c.executemany("INSERT INTO Unit (unit_name) VALUES (%s)", units)
-        
-        # Insert sample products
-        products = [
-            ('Paracetamol 500mg', 'medicine', 1, 100, 100, 1, 'in stock'),
-            ('Amoxicillin 500mg', 'medicine', 2, 50, 50, 2, 'in stock'),
-            ('Band-aid', 'supply', 4, 200, 50, 4, 'low stock'),
-            ('Antihistamine Syrup', 'medicine', 3, 30, 5, 3, 'out of stock')
-        ]
-        c.executemany("""
-            INSERT INTO Product 
-            (product_name, product_type, category_id, starting_inventory, 
-            stock_quantity, unit_id, stock_status) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, products)
-        
-        conn.commit()
-        return jsonify({'message': 'Sample data initialized successfully'})
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        return jsonify({'error': str(e)})
-    finally:
-        if conn is not None:
-            conn.close()
-
-@app.route('/add-purchase', methods=['POST'])
-@login_required
-def add_purchase():
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        product_id = request.form['product_id']
-        purchase_quantity = int(request.form['purchase_quantity'])
-        expiration_date = request.form['expiration_date']
-        c.execute("""
-            INSERT INTO Purchase (product_id, purchase_quantity, remaining_quantity, expiration_date)
-            VALUES (%s, %s, %s, %s)
-        """, (product_id, purchase_quantity, purchase_quantity, expiration_date))
-        conn.commit()
-        flash('Purchase added successfully!', 'success')
-        return redirect(url_for('purchases'))
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        flash(f'Error adding purchase: {str(e)}', 'error')
-        return redirect(url_for('purchases'))
-    finally:
-        if conn is not None:
-            conn.close()
-
-@app.route('/add-order', methods=['POST'])
-@login_required
-def add_order():
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-        )
-        c = conn.cursor()
-        product_id = request.form['product_id']
-        batch_number = request.form['batch_number']
-        order_quantity = int(request.form['order_quantity'])
-        c.execute("""
-            INSERT INTO "Order" (product_id, order_quantity, batch_number)
-            VALUES (%s, %s, %s)
-        """, (product_id, order_quantity, batch_number))
-        conn.commit()
-        flash('Order added successfully!', 'success')
-        return redirect(url_for('orders'))
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        flash(f'Error adding order: {str(e)}', 'error')
-        return redirect(url_for('orders'))
-    finally:
-        if conn is not None:
-            conn.close()
-
-def get_notifications(limit=10):
-    conn = psycopg2.connect(
-        dbname="MEDISYNC_DB",
-            user="postgres",
-            password="Chryscelle1!",
-            host="localhost",
-            port=1234
-    )
-    c = conn.cursor()
-    c.execute("SELECT id, message, created_at, is_read FROM Notification ORDER BY created_at DESC LIMIT %s", (limit,))
-    notifications = c.fetchall()
-    conn.close()
-    return notifications
-
-if __name__ == '__main__':
-    init_db()
-    app.run(debug=True, port=8080)
+# NOTE: Do NOT call init_db() here. On Render, we'll run migrations / schema separately.
+# Do NOT include app.run() — Render will use gunicorn to run the app.
